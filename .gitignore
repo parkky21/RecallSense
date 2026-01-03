@@ -5,6 +5,6 @@ build/
 dist/
 wheels/
 *.egg-info
-embeddings_data/*
+embeddings_data
 # Virtual environments
 .venv
