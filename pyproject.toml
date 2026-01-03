@@ -1,0 +1,14 @@
+[project]
+name = "image-retrieval"
+version = "0.1.0"
+description = "Image retrieval system using BLIP captioning and Qwen embeddings"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.51.0",
+    "sentence-transformers>=3.0.0",
+    "pillow>=10.0.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+]
