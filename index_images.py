@@ -1,7 +1,7 @@
 """
 Image Indexing Script
 This script processes all images in a folder, generates captions using BLIP,
-embeds them using Qwen3-Embedding-0.6B, and stores the embeddings locally.
+and embeds them using configurable embedding models.
 """
 
 import torch
@@ -10,8 +10,10 @@ import time
 from pathlib import Path
 from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
-from sentence_transformers import SentenceTransformer
 import numpy as np
+
+from config import get_enabled_models, get_model_config
+from embedding_models import create_embedding_model
 
 
 def get_image_files(folder_path):
@@ -33,49 +35,47 @@ def get_image_files(folder_path):
     return sorted(image_files_set)
 
 
-def load_existing_data():
+def load_existing_data(enabled_models):
     """Load existing embeddings and metadata if they exist."""
     output_dir = Path("embeddings_data")
-    qwen_embeddings_file = output_dir / "embeddings_qwen.npy"
-    gte_embeddings_file = output_dir / "embeddings_gte.npy"
-    gemma_embeddings_file = output_dir / "embeddings_gemma.npy"
-    old_embeddings_file = output_dir / "embeddings.npy"  # Old format
     metadata_file = output_dir / "metadata.json"
     
-    # Check for new format (all three models)
-    if (qwen_embeddings_file.exists() and gte_embeddings_file.exists() and 
-        gemma_embeddings_file.exists() and metadata_file.exists()):
-        try:
-            qwen_embeddings = np.load(qwen_embeddings_file)
-            gte_embeddings = np.load(gte_embeddings_file)
-            gemma_embeddings = np.load(gemma_embeddings_file)
-            with open(metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            return (qwen_embeddings, gte_embeddings, gemma_embeddings), metadata["image_paths"], metadata["captions"], metadata.get("embedding_times", {})
-        except Exception as e:
-            print(f"Warning: Could not load existing data: {e}")
-            return None, [], [], {}
-    
-    # Check for old format (two models - Qwen and GTE)
-    if qwen_embeddings_file.exists() and gte_embeddings_file.exists() and metadata_file.exists():
-        print("Warning: Found embeddings with only Qwen and GTE models.")
-        print("Please re-index to include EmbeddingGemma model.")
-        try:
-            qwen_embeddings = np.load(qwen_embeddings_file)
-            gte_embeddings = np.load(gte_embeddings_file)
-            with open(metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            # Return with None for gemma to trigger re-indexing
-            return (qwen_embeddings, gte_embeddings, None), metadata["image_paths"], metadata["captions"], metadata.get("embedding_times", {})
-        except Exception as e:
-            print(f"Warning: Could not load existing data: {e}")
-            return None, [], [], {}
-    
-    # Check for old format (single embeddings file)
-    if old_embeddings_file.exists() and metadata_file.exists():
-        print("Warning: Found old format embeddings. Please re-index to use all models.")
-        print("The old embeddings will be ignored. Run index_images.py to re-index your images.")
+    if not metadata_file.exists():
         return None, [], [], {}
+    
+    # Load metadata
+    try:
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load metadata: {e}")
+        return None, [], [], {}
+    
+    existing_paths = metadata.get("image_paths", [])
+    existing_captions = metadata.get("captions", [])
+    existing_times = metadata.get("embedding_times", {})
+    
+    # Load embeddings for enabled models only
+    existing_embeddings = {}
+    all_exist = True
+    
+    for model_key in enabled_models:
+        embeddings_file = output_dir / f"embeddings_{model_key}.npy"
+        if embeddings_file.exists():
+            try:
+                existing_embeddings[model_key] = np.load(embeddings_file)
+            except Exception as e:
+                print(f"Warning: Could not load {model_key} embeddings: {e}")
+                all_exist = False
+        else:
+            all_exist = False
+    
+    if all_exist and len(existing_paths) > 0:
+        return existing_embeddings, existing_paths, existing_captions, existing_times
+    
+    # Partial data exists
+    if existing_embeddings:
+        return existing_embeddings, existing_paths, existing_captions, existing_times
     
     return None, [], [], {}
 
@@ -99,8 +99,18 @@ def caption_image(image_path, processor, model, device):
 
 
 def main():
+    # Get enabled models from config
+    enabled_models = get_enabled_models()
+    
+    if not enabled_models:
+        print("Error: No embedding models are enabled in config.py")
+        print("Please enable at least one model in config.py")
+        return
+    
+    print(f"Enabled models: {', '.join(enabled_models)}")
+    
     # Configuration
-    folder_path = input("Enter the folder path containing images: ").strip()
+    folder_path = input("\nEnter the folder path containing images: ").strip()
     
     # Remove quotes if present
     if folder_path.startswith('"') and folder_path.endswith('"'):
@@ -120,67 +130,41 @@ def main():
     print(f"Found {len(image_files)} image(s) in folder.\n")
     
     # Load existing data
-    existing_data = load_existing_data()
-    existing_embeddings_tuple, existing_paths, existing_captions, existing_times = existing_data
+    existing_embeddings_dict, existing_paths, existing_captions, existing_times = load_existing_data(enabled_models)
     
-    # Check if EmbeddingGemma embeddings are missing
-    gemma_missing = False
-    if existing_embeddings_tuple is not None and len(existing_paths) > 0:
+    # Check which models need regeneration
+    models_to_regenerate = []
+    if existing_embeddings_dict is not None and len(existing_paths) > 0:
         print(f"Found {len(existing_paths)} already indexed image(s).")
-        # Create a set of normalized existing paths for quick lookup
         existing_paths_set = {normalize_path(p) for p in existing_paths}
-        if len(existing_embeddings_tuple) == 3:
-            existing_qwen_embeddings, existing_gte_embeddings, existing_gemma_embeddings = existing_embeddings_tuple
-            if existing_gemma_embeddings is None:
-                gemma_missing = True
-                print("Warning: EmbeddingGemma embeddings are missing. Will regenerate for all images.")
-        else:
-            # Old format with only 2 models
-            existing_qwen_embeddings, existing_gte_embeddings = existing_embeddings_tuple
-            existing_gemma_embeddings = None
-            gemma_missing = True
-            print("Warning: EmbeddingGemma embeddings are missing. Will regenerate for all images.")
+        
+        # Check which models are missing
+        for model_key in enabled_models:
+            if model_key not in existing_embeddings_dict:
+                models_to_regenerate.append(model_key)
+                print(f"Warning: {model_key} embeddings are missing. Will regenerate.")
     else:
         existing_paths_set = set()
-        existing_embeddings_tuple = None
-        existing_qwen_embeddings = None
-        existing_gte_embeddings = None
-        existing_gemma_embeddings = None
+        existing_embeddings_dict = {}
         existing_paths = []
         existing_captions = []
         existing_times = {}
+        models_to_regenerate = enabled_models.copy()
     
-    # Filter out already processed images (unless EmbeddingGemma is missing)
+    # Filter out already processed images
     new_image_files = []
-    if gemma_missing:
-        # If EmbeddingGemma is missing, we need to regenerate embeddings for all existing images
-        # But we can reuse existing captions, so we don't need to re-process images
-        print("EmbeddingGemma embeddings missing. Will regenerate using existing captions.")
-        # Check if all images in folder are already indexed
-        all_indexed = True
-        for img_path in image_files:
-            normalized = normalize_path(img_path)
-            if normalized not in existing_paths_set:
-                all_indexed = False
-                new_image_files.append(img_path)
-        
-        if all_indexed:
-            print("All images are already indexed. Will regenerate EmbeddingGemma embeddings only.")
-        else:
-            print(f"Found {len(new_image_files)} new image(s) to process, plus regenerating EmbeddingGemma for existing images.")
-    else:
-        for img_path in image_files:
-            normalized = normalize_path(img_path)
-            if normalized not in existing_paths_set:
-                new_image_files.append(img_path)
+    for img_path in image_files:
+        normalized = normalize_path(img_path)
+        if normalized not in existing_paths_set:
+            new_image_files.append(img_path)
     
-    if not new_image_files and not gemma_missing:
-        print("\nAll images are already indexed. No new images to process.")
+    if not new_image_files and not models_to_regenerate:
+        print("\nAll images are already indexed with all enabled models. No new images to process.")
         return
     
-    if gemma_missing:
-        print(f"\nWill process {len(new_image_files)} new image(s) and regenerate EmbeddingGemma embeddings for {len(existing_paths)} existing image(s).")
-    else:
+    if models_to_regenerate and not new_image_files:
+        print(f"\nWill regenerate embeddings for {len(existing_paths)} existing image(s) using existing captions.")
+    elif new_image_files:
         print(f"Found {len(new_image_files)} new image(s) to process.\n")
     
     # Check device availability
@@ -192,172 +176,151 @@ def main():
     else:
         print("CUDA not available, using CPU (this will be slower)")
     
-    # Load models (only if we have new images to process)
-    print("Loading BLIP captioning model...")
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    caption_model = BlipForConditionalGeneration.from_pretrained(
-        "Salesforce/blip-image-captioning-base", 
-        torch_dtype=dtype
-    ).to(device)
+    # Load BLIP captioning model (only if we have new images)
+    processor = None
+    caption_model = None
+    if new_image_files:
+        print("\nLoading BLIP captioning model...")
+        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        caption_model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base", 
+            torch_dtype=dtype
+        ).to(device)
     
-    print("Loading Qwen embedding model...")
-    qwen_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
-    
-    print("Loading GTE-multilingual embedding model...")
-    gte_model = SentenceTransformer("Alibaba-NLP/gte-multilingual-base", trust_remote_code=True)
-    
-    print("Loading EmbeddingGemma model...")
-    gemma_model = SentenceTransformer("google/embeddinggemma-300m")
+    # Load embedding models
+    print("\nLoading embedding models...")
+    embedding_models = {}
+    for model_key in enabled_models:
+        model_config = get_model_config(model_key)
+        print(f"  Loading {model_config['name']}...")
+        embedding_models[model_key] = create_embedding_model(model_key)
     
     # Process new images
     new_captions = []
     new_image_paths = []
     
-    for idx, image_path in enumerate(new_image_files, 1):
-        print(f"[{idx}/{len(new_image_files)}] Processing: {image_path.name}")
-        
-        # Generate caption
-        caption = caption_image(image_path, processor, caption_model, device)
-        
-        if caption:
-            new_captions.append(caption)
-            new_image_paths.append(str(image_path))
-            print(f"  Caption: {caption}")
-        else:
-            print(f"  Failed to generate caption for {image_path.name}")
+    if new_image_files:
+        for idx, image_path in enumerate(new_image_files, 1):
+            print(f"[{idx}/{len(new_image_files)}] Processing: {image_path.name}")
+            
+            # Generate caption
+            caption = caption_image(image_path, processor, caption_model, device)
+            
+            if caption:
+                new_captions.append(caption)
+                new_image_paths.append(str(image_path))
+                print(f"  Caption: {caption}")
+            else:
+                print(f"  Failed to generate caption for {image_path.name}")
     
-    # Handle EmbeddingGemma regeneration for existing images
-    gemma_existing_time = 0
-    if gemma_missing and existing_captions:
-        print(f"\nRegenerating EmbeddingGemma embeddings for {len(existing_captions)} existing image(s)...")
-        start_time = time.time()
-        existing_gemma_embeddings = gemma_model.encode_document(existing_captions)
-        gemma_existing_time = time.time() - start_time
-        print(f"  EmbeddingGemma (existing): {gemma_existing_time:.2f} seconds")
+    # Generate embeddings for existing images (if models need regeneration)
+    existing_embeddings_new = {}
+    existing_times_new = {}
     
-    # Generate embeddings for new images with all three models
-    new_qwen_embeddings = None
-    new_gte_embeddings = None
-    new_gemma_embeddings = None
-    qwen_time = 0
-    gte_time = 0
-    gemma_time = 0
+    if models_to_regenerate and existing_captions:
+        print(f"\nRegenerating embeddings for {len(existing_captions)} existing image(s)...")
+        for model_key in models_to_regenerate:
+            if model_key in embedding_models:
+                print(f"  Generating {model_key} embeddings...")
+                start_time = time.time()
+                existing_embeddings_new[model_key] = embedding_models[model_key].encode_documents(existing_captions)
+                elapsed_time = time.time() - start_time
+                existing_times_new[model_key] = elapsed_time
+                print(f"    {model_key}: {elapsed_time:.2f} seconds")
+    
+    # Generate embeddings for new images
+    new_embeddings = {}
+    new_times = {}
     
     if new_captions:
         print(f"\nGenerating embeddings for {len(new_captions)} new caption(s)...")
-        
-        # Qwen embeddings
-        print("  Generating Qwen embeddings...")
-        start_time = time.time()
-        new_qwen_embeddings = qwen_model.encode(new_captions)
-        qwen_time = time.time() - start_time
-        print(f"    Qwen: {qwen_time:.2f} seconds")
-        
-        # GTE embeddings
-        print("  Generating GTE-multilingual embeddings...")
-        start_time = time.time()
-        new_gte_embeddings = gte_model.encode(new_captions, normalize_embeddings=True)
-        gte_time = time.time() - start_time
-        print(f"    GTE: {gte_time:.2f} seconds")
-        
-        # EmbeddingGemma embeddings
-        print("  Generating EmbeddingGemma embeddings...")
-        start_time = time.time()
-        new_gemma_embeddings = gemma_model.encode_document(new_captions)
-        gemma_time = time.time() - start_time
-        print(f"    EmbeddingGemma: {gemma_time:.2f} seconds")
-    elif not gemma_missing:
+        for model_key in enabled_models:
+            if model_key in embedding_models:
+                print(f"  Generating {model_key} embeddings...")
+                start_time = time.time()
+                new_embeddings[model_key] = embedding_models[model_key].encode_documents(new_captions)
+                elapsed_time = time.time() - start_time
+                new_times[model_key] = elapsed_time
+                print(f"    {model_key}: {elapsed_time:.2f} seconds")
+    
+    if not new_captions and not models_to_regenerate:
         print("\nNo new captions were generated.")
-        if existing_embeddings_tuple is not None:
+        if existing_embeddings_dict:
             print("Keeping existing indexed data.")
         return
     
-    # Store timing information
-    embedding_times = existing_times.copy()
-    if new_captions:
-        embedding_times["qwen"] = embedding_times.get("qwen", 0) + qwen_time
-        embedding_times["gte"] = embedding_times.get("gte", 0) + gte_time
-        embedding_times["gemma"] = embedding_times.get("gemma", 0) + gemma_time
-        embedding_times["per_image_qwen"] = qwen_time / len(new_captions) if len(new_captions) > 0 else 0
-        embedding_times["per_image_gte"] = gte_time / len(new_captions) if len(new_captions) > 0 else 0
-        embedding_times["per_image_gemma"] = gemma_time / len(new_captions) if len(new_captions) > 0 else 0
-    
-    if gemma_missing and existing_captions:
-        embedding_times["gemma"] = embedding_times.get("gemma", 0) + gemma_existing_time
-        embedding_times["per_image_gemma"] = gemma_existing_time / len(existing_captions) if len(existing_captions) > 0 else 0
-    
-    # Merge with existing data
-    if existing_qwen_embeddings is not None:
-        if new_captions:
-            all_qwen_embeddings = np.vstack([existing_qwen_embeddings, new_qwen_embeddings])
-            all_gte_embeddings = np.vstack([existing_gte_embeddings, new_gte_embeddings])
-            all_paths = existing_paths + new_image_paths
-            all_captions = existing_captions + new_captions
-        else:
-            # Only regenerating EmbeddingGemma
-            all_qwen_embeddings = existing_qwen_embeddings
-            all_gte_embeddings = existing_gte_embeddings
-            all_paths = existing_paths
-            all_captions = existing_captions
-        
-        # Handle EmbeddingGemma embeddings
-        if gemma_missing:
-            # Use regenerated EmbeddingGemma embeddings
-            all_gemma_embeddings = existing_gemma_embeddings
-            if new_captions:
-                # Merge with new EmbeddingGemma embeddings if any
-                all_gemma_embeddings = np.vstack([all_gemma_embeddings, new_gemma_embeddings])
-        elif existing_gemma_embeddings is not None:
-            if new_captions:
-                all_gemma_embeddings = np.vstack([existing_gemma_embeddings, new_gemma_embeddings])
+    # Merge embeddings
+    all_embeddings = {}
+    for model_key in enabled_models:
+        if model_key in existing_embeddings_dict:
+            existing_emb = existing_embeddings_dict[model_key]
+            if model_key in new_embeddings:
+                all_embeddings[model_key] = np.vstack([existing_emb, new_embeddings[model_key]])
             else:
-                all_gemma_embeddings = existing_gemma_embeddings
-        else:
-            all_gemma_embeddings = new_gemma_embeddings
-        
-        if new_captions:
-            print(f"Merged with {len(existing_paths)} existing image(s).")
-        else:
-            print(f"Regenerated EmbeddingGemma embeddings for {len(existing_paths)} existing image(s).")
+                all_embeddings[model_key] = existing_emb
+        elif model_key in existing_embeddings_new:
+            # Regenerated embeddings for existing images
+            if model_key in new_embeddings:
+                all_embeddings[model_key] = np.vstack([existing_embeddings_new[model_key], new_embeddings[model_key]])
+            else:
+                all_embeddings[model_key] = existing_embeddings_new[model_key]
+        elif model_key in new_embeddings:
+            all_embeddings[model_key] = new_embeddings[model_key]
+    
+    # Update paths and captions
+    if new_image_paths:
+        all_paths = existing_paths + new_image_paths
+        all_captions = existing_captions + new_captions
     else:
-        all_qwen_embeddings = new_qwen_embeddings
-        all_gte_embeddings = new_gte_embeddings
-        all_gemma_embeddings = new_gemma_embeddings
-        all_paths = new_image_paths
-        all_captions = new_captions
+        all_paths = existing_paths
+        all_captions = existing_captions
+    
+    # Update timing information
+    embedding_times = existing_times.copy()
+    for model_key in enabled_models:
+        if model_key in new_times:
+            embedding_times[model_key] = embedding_times.get(model_key, 0) + new_times[model_key]
+            if new_captions:
+                embedding_times[f"per_image_{model_key}"] = new_times[model_key] / len(new_captions)
+        if model_key in existing_times_new:
+            embedding_times[model_key] = embedding_times.get(model_key, 0) + existing_times_new[model_key]
+            if existing_captions:
+                embedding_times[f"per_image_{model_key}"] = existing_times_new[model_key] / len(existing_captions)
     
     # Store results
     output_dir = Path("embeddings_data")
     output_dir.mkdir(exist_ok=True)
     
-    # Save embeddings as numpy arrays
-    qwen_embeddings_file = output_dir / "embeddings_qwen.npy"
-    gte_embeddings_file = output_dir / "embeddings_gte.npy"
-    gemma_embeddings_file = output_dir / "embeddings_gemma.npy"
-    np.save(qwen_embeddings_file, all_qwen_embeddings)
-    np.save(gte_embeddings_file, all_gte_embeddings)
-    np.save(gemma_embeddings_file, all_gemma_embeddings)
-    print(f"Saved Qwen embeddings to: {qwen_embeddings_file}")
-    print(f"Saved GTE embeddings to: {gte_embeddings_file}")
-    print(f"Saved EmbeddingGemma embeddings to: {gemma_embeddings_file}")
+    # Save embeddings
+    for model_key in enabled_models:
+        if model_key in all_embeddings:
+            embeddings_file = output_dir / f"embeddings_{model_key}.npy"
+            np.save(embeddings_file, all_embeddings[model_key])
+            print(f"Saved {model_key} embeddings to: {embeddings_file}")
     
-    # Save metadata (image paths, captions, and timing)
+    # Save metadata
     metadata = {
         "image_paths": all_paths,
         "captions": all_captions,
-        "embedding_times": embedding_times
+        "embedding_times": embedding_times,
+        "enabled_models": enabled_models
     }
     metadata_file = output_dir / "metadata.json"
     with open(metadata_file, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     print(f"Saved metadata to: {metadata_file}")
     
+    # Summary
     print(f"\n✓ Successfully indexed {len(new_image_paths)} new image(s)!")
     print(f"  Total indexed images: {len(all_paths)}")
-    print(f"  Embedding times - Qwen: {qwen_time:.2f}s, GTE: {gte_time:.2f}s, EmbeddingGemma: {gemma_time:.2f}s")
-    print(f"  Per image - Qwen: {embedding_times['per_image_qwen']:.4f}s, GTE: {embedding_times['per_image_gte']:.4f}s, EmbeddingGemma: {embedding_times['per_image_gemma']:.4f}s")
+    if new_times:
+        times_str = ", ".join([f"{k}: {v:.2f}s" for k, v in new_times.items()])
+        print(f"  Embedding times - {times_str}")
+        per_image_str = ", ".join([f"{k}: {embedding_times.get(f'per_image_{k}', 0):.4f}s" 
+                                   for k in enabled_models if f'per_image_{k}' in embedding_times])
+        if per_image_str:
+            print(f"  Per image - {per_image_str}")
 
 
 if __name__ == "__main__":
     main()
-

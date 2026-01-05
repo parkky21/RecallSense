@@ -38,11 +38,13 @@
     "course completion certificate for mathworks"
   ],
   "embedding_times": {
-    "qwen": 7.3691864013671875,
-    "gte": 1.7150390148162842,
-    "gemma": 2.379654884338379,
-    "per_image_qwen": 0.43348155302159924,
-    "per_image_gte": 0.10088464793036966,
-    "per_image_gemma": 0.13997969907872818
-  }
+    "gte": 1.8855996131896973,
+    "per_image_gte": 0.11091762430527631,
+    "gemma": 2.454510450363159,
+    "per_image_gemma": 0.14438296766842112
+  },
+  "enabled_models": [
+    "gte",
+    "gemma"
+  ]
 }

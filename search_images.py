@@ -10,11 +10,13 @@ import numpy as np
 import torch
 import time
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+
+from config import get_enabled_models, get_model_config
+from embedding_models import create_embedding_model
 
 
 def get_image_files(folder_path):
@@ -41,27 +43,45 @@ def normalize_path(path):
     return str(Path(path).resolve())
 
 
-def load_embeddings_data():
+def load_embeddings_data(enabled_models):
     """Load stored embeddings and metadata."""
     output_dir = Path("embeddings_data")
-    
-    qwen_embeddings_file = output_dir / "embeddings_qwen.npy"
-    gte_embeddings_file = output_dir / "embeddings_gte.npy"
-    gemma_embeddings_file = output_dir / "embeddings_gemma.npy"
     metadata_file = output_dir / "metadata.json"
     
-    if (qwen_embeddings_file.exists() and gte_embeddings_file.exists() and 
-        gemma_embeddings_file.exists() and metadata_file.exists()):
-        try:
-            qwen_embeddings = np.load(qwen_embeddings_file)
-            gte_embeddings = np.load(gte_embeddings_file)
-            gemma_embeddings = np.load(gemma_embeddings_file)
-            with open(metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            return (qwen_embeddings, gte_embeddings, gemma_embeddings), metadata["image_paths"], metadata["captions"]
-        except Exception as e:
-            print(f"Warning: Could not load existing data: {e}")
-            return None, [], []
+    if not metadata_file.exists():
+        return None, [], []
+    
+    try:
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load metadata: {e}")
+        return None, [], []
+    
+    image_paths = metadata.get("image_paths", [])
+    captions = metadata.get("captions", [])
+    
+    # Load embeddings for enabled models
+    embeddings_dict = {}
+    all_exist = True
+    
+    for model_key in enabled_models:
+        embeddings_file = output_dir / f"embeddings_{model_key}.npy"
+        if embeddings_file.exists():
+            try:
+                embeddings_dict[model_key] = np.load(embeddings_file)
+            except Exception as e:
+                print(f"Warning: Could not load {model_key} embeddings: {e}")
+                all_exist = False
+        else:
+            all_exist = False
+    
+    if all_exist and len(image_paths) > 0:
+        return embeddings_dict, image_paths, captions
+    
+    if embeddings_dict:
+        return embeddings_dict, image_paths, captions
+    
     return None, [], []
 
 
@@ -78,7 +98,7 @@ def caption_image(image_path, processor, model, device):
         return None
 
 
-def index_folder_images(folder_path, processor, caption_model, qwen_model, gte_model, gemma_model, device, existing_paths_set):
+def index_folder_images(folder_path, processor, caption_model, embedding_models, device, existing_paths_set, enabled_models):
     """Index images from a folder on-the-fly."""
     print(f"\nIndexing images from: {folder_path}")
     
@@ -87,7 +107,7 @@ def index_folder_images(folder_path, processor, caption_model, qwen_model, gte_m
     
     if not image_files:
         print("No image files found in the specified folder.")
-        return None, None, None, [], []
+        return {}, [], []
     
     # Filter out already indexed images
     new_image_files = []
@@ -98,7 +118,7 @@ def index_folder_images(folder_path, processor, caption_model, qwen_model, gte_m
     
     if not new_image_files:
         print("All images in this folder are already indexed.")
-        return None, None, None, [], []
+        return {}, [], []
     
     print(f"Found {len(new_image_files)} new image(s) to index...")
     
@@ -115,116 +135,53 @@ def index_folder_images(folder_path, processor, caption_model, qwen_model, gte_m
             print(f"    Caption: {caption}")
     
     if not captions:
-        return None, None, None, [], []
+        return {}, [], []
     
-    # Generate embeddings with all three models
+    # Generate embeddings with enabled models
     print(f"Generating embeddings for {len(captions)} image(s)...")
-    start_time = time.time()
-    qwen_embeddings = qwen_model.encode(captions)
-    qwen_time = time.time() - start_time
-    print(f"  Qwen: {qwen_time:.2f} seconds")
+    embeddings_dict = {}
     
-    start_time = time.time()
-    gte_embeddings = gte_model.encode(captions, normalize_embeddings=True)
-    gte_time = time.time() - start_time
-    print(f"  GTE: {gte_time:.2f} seconds")
+    for model_key in enabled_models:
+        if model_key in embedding_models:
+            print(f"  {model_key}...")
+            start_time = time.time()
+            embeddings_dict[model_key] = embedding_models[model_key].encode_documents(captions)
+            elapsed_time = time.time() - start_time
+            print(f"    {model_key}: {elapsed_time:.2f} seconds")
     
-    start_time = time.time()
-    gemma_embeddings = gemma_model.encode_document(captions)
-    gemma_time = time.time() - start_time
-    print(f"  EmbeddingGemma: {gemma_time:.2f} seconds")
-    
-    return qwen_embeddings, gte_embeddings, gemma_embeddings, image_paths, captions
+    return embeddings_dict, image_paths, captions
 
 
-def compute_similarity(query_embedding, document_embeddings):
-    """Compute cosine similarity between query and document embeddings."""
-    # Normalize embeddings
-    query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-8)
-    doc_norms = document_embeddings / (np.linalg.norm(document_embeddings, axis=1, keepdims=True) + 1e-8)
+def display_all_models(results_dict, top_k=3):
+    """Display images from all enabled models in a grid layout."""
+    num_models = len(results_dict)
+    if num_models == 0:
+        print("No results to display.")
+        return
     
-    # Compute cosine similarity
-    similarities = np.dot(doc_norms, query_norm)
-    return similarities
-
-
-def display_images(image_paths, captions, similarities, top_k=3, model_name=""):
-    """Display the top K images with their captions and similarity scores."""
-    fig, axes = plt.subplots(1, top_k, figsize=(15, 5))
+    fig, axes = plt.subplots(num_models, top_k, figsize=(15, 5 * num_models))
     
+    if num_models == 1:
+        axes = axes.reshape(1, -1)
     if top_k == 1:
-        axes = [axes]
+        axes = axes.reshape(-1, 1)
     
-    title_prefix = f"[{model_name}] " if model_name else ""
-    
-    for idx, (img_path, caption, sim) in enumerate(zip(image_paths, captions, similarities)):
-        try:
-            img = mpimg.imread(img_path)
-            axes[idx].imshow(img)
-            axes[idx].axis('off')
-            axes[idx].set_title(f"{title_prefix}Similarity: {sim:.4f}\n{caption}", 
-                              fontsize=10, wrap=True)
-        except Exception as e:
-            axes[idx].text(0.5, 0.5, f"Error loading image:\n{img_path}\n{e}", 
-                          ha='center', va='center', fontsize=8)
-            axes[idx].axis('off')
-    
-    plt.tight_layout()
-    plt.show()
-
-
-def display_all_models(qwen_paths, qwen_captions, qwen_similarities, 
-                       gte_paths, gte_captions, gte_similarities,
-                       gemma_paths, gemma_captions, gemma_similarities, top_k=3):
-    """Display images from all three models side-by-side in a 3-row layout."""
-    fig, axes = plt.subplots(3, top_k, figsize=(15, 15))
-    
-    if top_k == 1:
-        axes = axes.reshape(3, 1)
-    
-    # Display Qwen results (top row)
-    for idx, (img_path, caption, sim) in enumerate(zip(qwen_paths, qwen_captions, qwen_similarities)):
-        try:
-            img = mpimg.imread(img_path)
-            axes[0, idx].imshow(img)
-            axes[0, idx].axis('off')
-            axes[0, idx].set_title(f"[Qwen] Similarity: {sim:.4f}\n{caption}", 
-                                  fontsize=8, wrap=True)
-        except Exception as e:
-            axes[0, idx].text(0.5, 0.5, f"Error loading image:\n{img_path}\n{e}", 
-                            ha='center', va='center', fontsize=7)
-            axes[0, idx].axis('off')
-    
-    # Display GTE results (middle row)
-    for idx, (img_path, caption, sim) in enumerate(zip(gte_paths, gte_captions, gte_similarities)):
-        try:
-            img = mpimg.imread(img_path)
-            axes[1, idx].imshow(img)
-            axes[1, idx].axis('off')
-            axes[1, idx].set_title(f"[GTE] Similarity: {sim:.4f}\n{caption}", 
-                                  fontsize=8, wrap=True)
-        except Exception as e:
-            axes[1, idx].text(0.5, 0.5, f"Error loading image:\n{img_path}\n{e}", 
-                            ha='center', va='center', fontsize=7)
-            axes[1, idx].axis('off')
-    
-    # Display EmbeddingGemma results (bottom row)
-    for idx, (img_path, caption, sim) in enumerate(zip(gemma_paths, gemma_captions, gemma_similarities)):
-        try:
-            img = mpimg.imread(img_path)
-            axes[2, idx].imshow(img)
-            axes[2, idx].axis('off')
-            axes[2, idx].set_title(f"[EmbeddingGemma] Similarity: {sim:.4f}\n{caption}", 
-                                  fontsize=8, wrap=True)
-        except Exception as e:
-            axes[2, idx].text(0.5, 0.5, f"Error loading image:\n{img_path}\n{e}", 
-                            ha='center', va='center', fontsize=7)
-            axes[2, idx].axis('off')
-    
-    # Add row labels
-    fig.text(0.02, 0.83, 'Qwen Model', rotation=90, fontsize=11, fontweight='bold', va='center')
-    fig.text(0.02, 0.50, 'GTE Model', rotation=90, fontsize=11, fontweight='bold', va='center')
-    fig.text(0.02, 0.17, 'EmbeddingGemma', rotation=90, fontsize=11, fontweight='bold', va='center')
+    for row_idx, (model_key, (paths, captions, similarities)) in enumerate(results_dict.items()):
+        for col_idx, (img_path, caption, sim) in enumerate(zip(paths, captions, similarities)):
+            try:
+                img = mpimg.imread(img_path)
+                axes[row_idx, col_idx].imshow(img)
+                axes[row_idx, col_idx].axis('off')
+                axes[row_idx, col_idx].set_title(f"[{model_key.upper()}] Similarity: {sim:.4f}\n{caption}", 
+                                                fontsize=8, wrap=True)
+            except Exception as e:
+                axes[row_idx, col_idx].text(0.5, 0.5, f"Error loading image:\n{img_path}\n{e}", 
+                                          ha='center', va='center', fontsize=7)
+                axes[row_idx, col_idx].axis('off')
+        
+        # Add row label
+        fig.text(0.02, 0.95 - (row_idx * 0.9 / num_models), f'{model_key.upper()} Model', 
+                rotation=90, fontsize=11, fontweight='bold', va='center')
     
     plt.tight_layout()
     plt.subplots_adjust(left=0.05)
@@ -232,16 +189,26 @@ def display_all_models(qwen_paths, qwen_captions, qwen_similarities,
 
 
 def main():
-    # Load existing indexed data
-    print("Loading existing embeddings and metadata...")
-    document_embeddings, image_paths, captions = load_embeddings_data()
+    # Get enabled models from config
+    enabled_models = get_enabled_models()
     
-    if document_embeddings is not None:
+    if not enabled_models:
+        print("Error: No embedding models are enabled in config.py")
+        print("Please enable at least one model in config.py")
+        return
+    
+    print(f"Enabled models: {', '.join(enabled_models)}")
+    
+    # Load existing indexed data
+    print("\nLoading existing embeddings and metadata...")
+    embeddings_dict, image_paths, captions = load_embeddings_data(enabled_models)
+    
+    if embeddings_dict is not None:
         print(f"Loaded {len(image_paths)} indexed image(s).")
         existing_paths_set = {normalize_path(p) for p in image_paths}
     else:
         print("No existing indexed images found.")
-        document_embeddings = None
+        embeddings_dict = {}
         image_paths = []
         captions = []
         existing_paths_set = set()
@@ -279,47 +246,38 @@ def main():
         ).to(device)
     
     # Load embedding models
-    print("Loading Qwen embedding model...")
-    qwen_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
-    
-    print("Loading GTE-multilingual embedding model...")
-    gte_model = SentenceTransformer("Alibaba-NLP/gte-multilingual-base", trust_remote_code=True)
-    
-    print("Loading EmbeddingGemma model...")
-    gemma_model = SentenceTransformer("google/embeddinggemma-300m")
+    print("\nLoading embedding models...")
+    embedding_models = {}
+    for model_key in enabled_models:
+        model_config = get_model_config(model_key)
+        print(f"  Loading {model_config['name']}...")
+        embedding_models[model_key] = create_embedding_model(model_key)
     
     # Index additional folder if provided
     if additional_folder and processor and caption_model:
-        new_qwen_embeddings, new_gte_embeddings, new_gemma_embeddings, new_paths, new_captions = index_folder_images(
-            additional_folder, processor, caption_model, qwen_model, gte_model, gemma_model, device, existing_paths_set
+        new_embeddings_dict, new_paths, new_captions = index_folder_images(
+            additional_folder, processor, caption_model, embedding_models, device, existing_paths_set, enabled_models
         )
         
-        if new_qwen_embeddings is not None and len(new_paths) > 0:
+        if new_embeddings_dict and len(new_paths) > 0:
             # Merge with existing data
-            if document_embeddings is not None:
-                existing_qwen, existing_gte, existing_gemma = document_embeddings
-                all_qwen_embeddings = np.vstack([existing_qwen, new_qwen_embeddings])
-                all_gte_embeddings = np.vstack([existing_gte, new_gte_embeddings])
-                all_gemma_embeddings = np.vstack([existing_gemma, new_gemma_embeddings])
-                all_paths = image_paths + new_paths
-                all_captions = captions + new_captions
+            if embeddings_dict:
+                for model_key in enabled_models:
+                    if model_key in embeddings_dict and model_key in new_embeddings_dict:
+                        embeddings_dict[model_key] = np.vstack([embeddings_dict[model_key], new_embeddings_dict[model_key]])
+                    elif model_key in new_embeddings_dict:
+                        embeddings_dict[model_key] = new_embeddings_dict[model_key]
+                image_paths = image_paths + new_paths
+                captions = captions + new_captions
             else:
-                all_qwen_embeddings = new_qwen_embeddings
-                all_gte_embeddings = new_gte_embeddings
-                all_gemma_embeddings = new_gemma_embeddings
-                all_paths = new_paths
-                all_captions = new_captions
-            
-            document_embeddings = (all_qwen_embeddings, all_gte_embeddings, all_gemma_embeddings)
-            image_paths = all_paths
-            captions = all_captions
+                embeddings_dict = new_embeddings_dict
+                image_paths = new_paths
+                captions = new_captions
             print(f"\nTotal images available for search: {len(image_paths)}")
     
-    if document_embeddings is None or len(image_paths) == 0:
+    if not embeddings_dict or len(image_paths) == 0:
         print("\nNo images available for search. Please index some images first.")
         return
-    
-    qwen_embeddings, gte_embeddings, gemma_embeddings = document_embeddings
     
     # Get query from user
     query = input("\nEnter your search query: ").strip()
@@ -328,119 +286,65 @@ def main():
         print("Query cannot be empty.")
         return
     
-    # Search with all three models
-    print(f"\nSearching with all three models for query: '{query}'...")
+    # Search with all enabled models
+    print(f"\nSearching with all enabled models for query: '{query}'...")
     print("-" * 60)
     
-    # Qwen search
-    print("\n[Qwen Model]")
-    start_time = time.time()
-    qwen_query_embedding = qwen_model.encode(query, prompt_name="query")
-    qwen_similarities = compute_similarity(qwen_query_embedding, qwen_embeddings)
-    qwen_search_time = time.time() - start_time
+    search_results = {}
+    search_times = {}
     
-    # GTE search
-    print("[GTE-multilingual Model]")
-    start_time = time.time()
-    gte_query_embedding = gte_model.encode([query], normalize_embeddings=True)
-    gte_similarities = compute_similarity(gte_query_embedding[0], gte_embeddings)
-    gte_search_time = time.time() - start_time
-    
-    # EmbeddingGemma search
-    print("[EmbeddingGemma Model]")
-    start_time = time.time()
-    gemma_query_embedding = gemma_model.encode_query(query)
-    # Use model's similarity method for EmbeddingGemma
-    gemma_similarities_tensor = gemma_model.similarity(gemma_query_embedding, gemma_embeddings)
-    gemma_similarities = gemma_similarities_tensor.cpu().numpy()[0] if hasattr(gemma_similarities_tensor, 'cpu') else np.array(gemma_similarities_tensor)[0]
-    gemma_search_time = time.time() - start_time
-    
-    print(f"\nSearch timing:")
-    print(f"  Qwen: {qwen_search_time:.4f} seconds")
-    print(f"  GTE: {gte_search_time:.4f} seconds")
-    print(f"  EmbeddingGemma: {gemma_search_time:.4f} seconds")
-    
-    # Get top 3 results for each model
-    top_k = 3
-    qwen_top_indices = np.argsort(qwen_similarities)[::-1][:top_k]
-    gte_top_indices = np.argsort(gte_similarities)[::-1][:top_k]
-    gemma_top_indices = np.argsort(gemma_similarities)[::-1][:top_k]
-    
-    # Display Qwen results
-    print(f"\n{'='*60}")
-    print(f"Top {top_k} results - Qwen Model:")
-    print("-" * 60)
-    
-    qwen_top_paths = []
-    qwen_top_captions = []
-    qwen_top_similarities = []
-    
-    for rank, idx in enumerate(qwen_top_indices, 1):
-        similarity_score = qwen_similarities[idx]
-        caption = captions[idx]
-        img_path = image_paths[idx]
+    for model_key in enabled_models:
+        if model_key not in embeddings_dict:
+            print(f"Warning: {model_key} embeddings not found. Skipping.")
+            continue
         
-        print(f"\n{rank}. Similarity: {similarity_score:.4f}")
-        print(f"   Image: {img_path}")
-        print(f"   Caption: {caption}")
+        print(f"\n[{model_key.upper()} Model]")
+        start_time = time.time()
         
-        qwen_top_paths.append(img_path)
-        qwen_top_captions.append(caption)
-        qwen_top_similarities.append(similarity_score)
-    
-    # Display GTE results
-    print(f"\n{'='*60}")
-    print(f"Top {top_k} results - GTE-multilingual Model:")
-    print("-" * 60)
-    
-    gte_top_paths = []
-    gte_top_captions = []
-    gte_top_similarities = []
-    
-    for rank, idx in enumerate(gte_top_indices, 1):
-        similarity_score = gte_similarities[idx]
-        caption = captions[idx]
-        img_path = image_paths[idx]
+        # Encode query
+        query_embedding = embedding_models[model_key].encode_query(query)
         
-        print(f"\n{rank}. Similarity: {similarity_score:.4f}")
-        print(f"   Image: {img_path}")
-        print(f"   Caption: {caption}")
-        
-        gte_top_paths.append(img_path)
-        gte_top_captions.append(caption)
-        gte_top_similarities.append(similarity_score)
-    
-    # Display EmbeddingGemma results
-    print(f"\n{'='*60}")
-    print(f"Top {top_k} results - EmbeddingGemma Model:")
-    print("-" * 60)
-    
-    gemma_top_paths = []
-    gemma_top_captions = []
-    gemma_top_similarities = []
-    
-    for rank, idx in enumerate(gemma_top_indices, 1):
-        similarity_score = gemma_similarities[idx]
-        caption = captions[idx]
-        img_path = image_paths[idx]
-        
-        print(f"\n{rank}. Similarity: {similarity_score:.4f}")
-        print(f"   Image: {img_path}")
-        print(f"   Caption: {caption}")
-        
-        gemma_top_paths.append(img_path)
-        gemma_top_captions.append(caption)
-        gemma_top_similarities.append(similarity_score)
-    
-    # Display images from all three models side-by-side
-    print("\nDisplaying images from all three models (Qwen on top, GTE in middle, EmbeddingGemma on bottom)...")
-    try:
-        display_all_models(
-            qwen_top_paths, qwen_top_captions, qwen_top_similarities,
-            gte_top_paths, gte_top_captions, gte_top_similarities,
-            gemma_top_paths, gemma_top_captions, gemma_top_similarities,
-            top_k=top_k
+        # Compute similarities
+        similarities = embedding_models[model_key].compute_similarity(
+            query_embedding, embeddings_dict[model_key]
         )
+        
+        search_time = time.time() - start_time
+        search_times[model_key] = search_time
+        
+        # Get top 3 results
+        top_k = 3
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        
+        # Store results
+        top_paths = []
+        top_captions = []
+        top_similarities = []
+        
+        for rank, idx in enumerate(top_indices, 1):
+            similarity_score = similarities[idx]
+            caption = captions[idx]
+            img_path = image_paths[idx]
+            
+            print(f"\n{rank}. Similarity: {similarity_score:.4f}")
+            print(f"   Image: {img_path}")
+            print(f"   Caption: {caption}")
+            
+            top_paths.append(img_path)
+            top_captions.append(caption)
+            top_similarities.append(similarity_score)
+        
+        search_results[model_key] = (top_paths, top_captions, top_similarities)
+    
+    # Display timing
+    print(f"\nSearch timing:")
+    for model_key, search_time in search_times.items():
+        print(f"  {model_key}: {search_time:.4f} seconds")
+    
+    # Display images
+    print("\nDisplaying images from all enabled models...")
+    try:
+        display_all_models(search_results, top_k=3)
     except Exception as e:
         print(f"Error displaying images: {e}")
         print("You can manually view the images at the paths listed above.")
@@ -448,4 +352,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
