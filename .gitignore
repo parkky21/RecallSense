@@ -9,3 +9,4 @@ embeddings_data
 # Virtual environments
 .venv
 embeddings_data/*
+.env
