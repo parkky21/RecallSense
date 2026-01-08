@@ -8,7 +8,7 @@ Enable/disable embedding models here.
 EMBEDDING_MODELS = {
     "qwen": False,      # Qwen/Qwen3-Embedding-0.6B
     "gte": True,        # Alibaba-NLP/gte-multilingual-base (DEFAULT)
-    "gemma": True,     # google/embeddinggemma-300m
+    "gemma": False,     # google/embeddinggemma-300m
 }
 
 # Model configurations
