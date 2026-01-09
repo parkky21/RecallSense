@@ -181,10 +181,10 @@ def main():
     caption_model = None
     if new_image_files:
         print("\nLoading BLIP captioning model...")
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base", use_fast=False)
         caption_model = BlipForConditionalGeneration.from_pretrained(
             "Salesforce/blip-image-captioning-base", 
-            torch_dtype=dtype
+            dtype=dtype
         ).to(device)
     
     # Load embedding models

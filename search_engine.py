@@ -72,10 +72,10 @@ class SearchEngine:
         if self.processor is None:
             model_name = get_caption_model_name()
             print(f"Loading BLIP captioning model ({model_name})...")
-            self.processor = BlipProcessor.from_pretrained(model_name)
+            self.processor = BlipProcessor.from_pretrained(model_name, use_fast=False)
             self.caption_model = BlipForConditionalGeneration.from_pretrained(
                 model_name, 
-                torch_dtype=self.dtype
+                dtype=self.dtype
             ).to(self.device)
 
     def _get_image_files(self, folder_path):

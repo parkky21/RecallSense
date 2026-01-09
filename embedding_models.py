@@ -7,15 +7,51 @@ import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 from typing import List, Union, Optional
+import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class BaseEmbeddingModel:
     """Base class for embedding models."""
     
-    def __init__(self, model_name: str, **kwargs):
-        """Initialize the embedding model."""
+    def __init__(self, model_name: str, max_retries: int = 3, retry_delay: int = 5, **kwargs):
+        """Initialize the embedding model with retry logic.
+        
+        Args:
+            model_name: Name of the model to load
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay in seconds between retries
+            **kwargs: Additional arguments passed to SentenceTransformer
+        """
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name, **kwargs)
+        self.model = None
+        
+        # Retry logic for model loading
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Loading model '{model_name}' (attempt {attempt + 1}/{max_retries})...")
+                self.model = SentenceTransformer(model_name, **kwargs)
+                logger.info(f"✅ Successfully loaded model '{model_name}'")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️  Failed to load model (attempt {attempt + 1}/{max_retries}): {e}")
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"❌ Failed to load model after {max_retries} attempts: {e}")
+                    raise RuntimeError(
+                        f"Failed to load model '{model_name}' after {max_retries} attempts. "
+                        f"Error: {e}\n\n"
+                        f"Possible solutions:\n"
+                        f"1. Check your internet connection\n"
+                        f"2. Run: python fix_model_download.py '{model_name}' to clean incomplete downloads\n"
+                        f"3. Check Hugging Face authentication if model requires it"
+                    ) from e
     
     def encode_documents(self, texts: List[str], **kwargs) -> np.ndarray:
         """Encode documents/captions into embeddings."""
