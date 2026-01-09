@@ -5,8 +5,10 @@ build/
 dist/
 wheels/
 *.egg-info
-embeddings_data/
+
 # Virtual environments
 .venv
 embeddings_data/*
 .env
+
+embeddings_data/

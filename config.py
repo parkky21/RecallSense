@@ -53,3 +53,15 @@ def get_model_config(model_key):
     """Get configuration for a specific model."""
     return MODEL_CONFIGS.get(model_key, {})
 
+# Captioning Models Configuration
+CAPTION_MODELS = {
+    "base": "Salesforce/blip-image-captioning-base",
+    "large": "Salesforce/blip-image-captioning-large",
+}
+
+# Set the active caption model ("base" or "large")
+SELECTED_CAPTION_MODEL = "large"
+
+def get_caption_model_name():
+    """Get the name of the selected caption model."""
+    return CAPTION_MODELS.get(SELECTED_CAPTION_MODEL, CAPTION_MODELS["large"])
